@@ -4,132 +4,57 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
+	"os/signal"
 	"sync"
+	"syscall"
+
+	"go-yjs-server/server"
+	natsync "go-yjs-server/sync"
 
 	"github.com/gorilla/websocket"
 )
 
 var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool {
-		return true
+		return true // Configure properly for production
 	},
-}
-
-type Client struct {
-	conn *websocket.Conn
-	send chan []byte
-	room *Room
-}
-
-type Room struct {
-	clients    map[*Client]bool
-	broadcast  chan []byte
-	register   chan *Client
-	unregister chan *Client
-	mu         sync.RWMutex
+	ReadBufferSize:  1024,
+	WriteBufferSize: 1024,
 }
 
 var (
-	rooms   = make(map[string]*Room)
-	roomsMu sync.RWMutex
+	rooms       = make(map[string]*server.Room)
+	roomsMu     sync.RWMutex
+	clientID    uint64
+	clientIDMu  sync.Mutex
+	syncService *natsync.SyncService
 )
 
-func getRoom(name string) *Room {
+func getOrCreateRoom(name string) *server.Room {
 	roomsMu.Lock()
 	defer roomsMu.Unlock()
 
-	if room, exists := rooms[name]; exists {
-		return room
+	room, ok := rooms[name]
+	if !ok {
+		log.Printf("Room %s not found in memory, creating new room", name)
+		room = server.NewRoom(name, syncService)
+		rooms[name] = room
+		log.Printf("Created room: %s (total rooms: %d)", name, len(rooms))
+	} else {
+		log.Printf("Room %s found in memory (reusing existing room)", name)
 	}
-
-	room := &Room{
-		clients:    make(map[*Client]bool),
-		broadcast:  make(chan []byte, 256),
-		register:   make(chan *Client),
-		unregister: make(chan *Client),
-	}
-
-	go room.run()
-	rooms[name] = room
-	log.Printf("Created new room: %s", name)
 	return room
 }
 
-func (r *Room) run() {
-	for {
-		select {
-		case client := <-r.register:
-			r.mu.Lock()
-			r.clients[client] = true
-			count := len(r.clients)
-			r.mu.Unlock()
-			log.Printf("Client connected (total: %d)", count)
-
-		case client := <-r.unregister:
-			r.mu.Lock()
-			if _, ok := r.clients[client]; ok {
-				delete(r.clients, client)
-				close(client.send)
-				count := len(r.clients)
-				r.mu.Unlock()
-				log.Printf("Client disconnected (total: %d)", count)
-			} else {
-				r.mu.Unlock()
-			}
-
-		case message := <-r.broadcast:
-			r.mu.RLock()
-			for client := range r.clients {
-				select {
-				case client.send <- message:
-				default:
-					// Client's send buffer is full, skip
-				}
-			}
-			r.mu.RUnlock()
-		}
-	}
-}
-
-func (c *Client) readPump() {
-	defer func() {
-		c.room.unregister <- c
-		c.conn.Close()
-	}()
-
-	for {
-		messageType, message, err := c.conn.ReadMessage()
-		if err != nil {
-			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-				log.Printf("WebSocket error: %v", err)
-			}
-			break
-		}
-
-		// Only handle binary messages (Yjs uses binary)
-		if messageType == websocket.BinaryMessage {
-			// Broadcast the message to all clients in the room
-			c.room.broadcast <- message
-		}
-	}
-}
-
-func (c *Client) writePump() {
-	defer func() {
-		c.conn.Close()
-	}()
-
-	for message := range c.send {
-		err := c.conn.WriteMessage(websocket.BinaryMessage, message)
-		if err != nil {
-			log.Printf("Write error: %v", err)
-			return
-		}
-	}
+func generateClientID() uint64 {
+	clientIDMu.Lock()
+	defer clientIDMu.Unlock()
+	clientID++
+	return clientID
 }
 
 func handleWebSocket(w http.ResponseWriter, r *http.Request) {
-	// Get room name from URL path
 	roomName := r.URL.Path
 	if roomName == "" || roomName == "/" {
 		roomName = "/default"
@@ -139,26 +64,106 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		log.Printf("Upgrade failed: %v", err)
+		log.Printf("Upgrade error: %v", err)
 		return
 	}
 
-	log.Printf("✓ WebSocket upgraded successfully")
+	room := getOrCreateRoom(roomName)
+	clientID := generateClientID()
 
-	room := getRoom(roomName)
-	client := &Client{
-		conn: conn,
-		send: make(chan []byte, 256),
-		room: room,
-	}
+	client := server.NewClient(conn, room, clientID)
+	room.AddClient(client)
 
-	room.register <- client
+	// Send initial sync
+	go client.SendInitialSync()
 
-	go client.writePump()
-	go client.readPump()
+	// Start pumps
+	go client.WritePump()
+	client.ReadPump()
 }
 
 func main() {
+	// Get NATS URL from environment or use default
+	natsURL := os.Getenv("NATS_URL")
+	if natsURL == "" {
+		natsURL = "nats://localhost:4222"
+	}
+
+	// Generate server ID (use hostname + PID for uniqueness)
+	hostname, _ := os.Hostname()
+	serverID := hostname + "-" + os.Getenv("SERVER_ID")
+	if serverID == hostname+"-" {
+		serverID = hostname
+	}
+
+	// Initialize NATS sync service
+	var err error
+	syncService, err = natsync.NewSyncService(natsURL, serverID)
+	if err != nil {
+		log.Printf("Warning: Failed to connect to NATS at %s: %v", natsURL, err)
+		log.Printf("Server will run in single-instance mode (no cross-server sync)")
+		syncService = nil
+	} else {
+		log.Printf("Connected to NATS at %s (Server ID: %s)", natsURL, serverID)
+		defer syncService.Close()
+	}
+
+	// Handle graceful shutdown
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-sigChan
+		log.Println("Shutting down...")
+		if syncService != nil {
+			syncService.Close()
+		}
+		os.Exit(0)
+	}()
+
+	// HTTP endpoint to fetch document state
+	http.HandleFunc("/doc/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+
+		if r.Method == "OPTIONS" {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		if r.Method != "GET" {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+
+		// Extract room name from path (e.g., /doc/flow-document -> flow-document)
+		roomName := r.URL.Path[len("/doc/"):]
+		if roomName == "" {
+			roomName = "/default"
+		} else {
+			roomName = "/" + roomName
+		}
+
+		// Get or create room to ensure it's loaded
+		room := getOrCreateRoom(roomName)
+
+		// Get document state
+		docState := room.GetDocumentState()
+
+		if len(docState) == 0 {
+			// No document state, return 204 No Content
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+
+		// Return document state as binary
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(docState)))
+		w.WriteHeader(http.StatusOK)
+		w.Write(docState)
+	})
+
+	// WebSocket endpoint
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
@@ -172,9 +177,17 @@ func main() {
 		handleWebSocket(w, r)
 	})
 
-	port := ":8080"
-	fmt.Printf("Yjs WebSocket Server")
-	fmt.Printf("Listening on: ws://localhost%s", port)
-
+	port := "0.0.0.0:8080"
+	log.Printf("═══════════════════════════════════════════════════")
+	log.Printf("  Y-protocol WebSocket Server")
+	log.Printf("═══════════════════════════════════════════════════")
+	if syncService != nil {
+		log.Printf("  ✓ Distributed mode (NATS JetStream)")
+		log.Printf("  ✓ Server ID: %s", serverID)
+	} else {
+		log.Printf("  ⚠ Single-instance mode (no NATS)")
+	}
+	log.Printf("  Listening on: ws://%s", port)
+	log.Printf("═══════════════════════════════════════════════════")
 	log.Fatal(http.ListenAndServe(port, nil))
 }

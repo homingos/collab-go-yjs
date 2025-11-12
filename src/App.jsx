@@ -1,4 +1,4 @@
-import { ReactFlow, addEdge, applyEdgeChanges, applyNodeChanges } from '@xyflow/react';
+import { ReactFlow, addEdge, applyEdgeChanges, applyNodeChanges, useReactFlow, ReactFlowProvider } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { WebsocketProvider } from 'y-websocket';
@@ -29,9 +29,10 @@ const generateUsername = () => {
   return `${adj}`;
 };
 
-export default function App() {
-  const [nodes, setNodes] = useState(initialNodes);
-  const [edges, setEdges] = useState(initialEdges);
+function FlowCanvas() {
+  const { screenToFlowPosition, flowToScreenPosition } = useReactFlow();
+  const [nodes, setNodes] = useState([]);
+  const [edges, setEdges] = useState([]);
   const [connected, setConnected] = useState(false);
   const [synced, setSynced] = useState(false);
   const [error, setError] = useState(null);
@@ -60,114 +61,154 @@ export default function App() {
     yNodesRef.current = yNodes;
     yEdgesRef.current = yEdges;
 
-    let provider;
-    try {
-      provider = new WebsocketProvider(
-        'ws://localhost:8080',
-        'flow-document',
-        ydoc
-      );
-      providerRef.current = provider;
-
-      provider.on('connection-error', (err) => {
-        console.error('WebSocket connection error:', err);
-        setError(`Connection error: ${err.message || 'Unknown error'}`);
+    // Fetch initial document state from HTTP endpoint before connecting WebSocket
+    const roomName = 'flow-document';
+    const docStateUrl = `http://localhost:8080/doc/${roomName}`;
+    
+    let cleanup = null;
+    
+    fetch(docStateUrl)
+      .then(response => {
+        if (response.status === 204 || response.status === 404) {
+          console.log('No existing document state, starting fresh');
+          return null;
+        }
+        if (!response.ok) {
+          throw new Error(`HTTP error! status: ${response.status}`);
+        }
+        return response.arrayBuffer();
+      })
+      .then(buffer => {
+        if (buffer && buffer.byteLength > 0) {
+          console.log(`Loading document state (${buffer.byteLength} bytes)`);
+          const update = new Uint8Array(buffer);
+          Y.applyUpdate(ydoc, update);
+          console.log('Document state loaded successfully');
+        }
+        
+        // Now connect WebSocket after loading initial state
+        return setupWebSocketProvider(roomName, ydoc, yNodes, yEdges);
+      })
+      .catch(error => {
+        console.error('Failed to fetch initial document state:', error);
+        // Still try to connect WebSocket even if fetch fails
+        return setupWebSocketProvider(roomName, ydoc, yNodes, yEdges);
+      })
+      .then(cleanupFn => {
+        cleanup = cleanupFn;
       });
 
-      provider.on('connection-close', (event) => {
-        console.log('WebSocket connection closed:', event);
-        setError('Connection closed');
-      });
+    function setupWebSocketProvider(roomName, ydoc, yNodes, yEdges) {
+      let provider;
+      try {
+        provider = new WebsocketProvider(
+          'ws://localhost:8080',
+          roomName,
+          ydoc
+        );
+        providerRef.current = provider;
 
-      const awareness = provider.awareness;
-      awareness.setLocalStateField('user', {
-        name: username,
-        color: `hsl(${Math.random() * 360}, 70%, 60%)`,
-      });
-
-      const awarenessChangeHandler = () => {
-        const states = awareness.getStates();
-        const newCursors = {};
-
-        states.forEach((state, clientId) => {
-          if (clientId !== awareness.clientID && state.cursor) {
-            newCursors[clientId] = {
-              ...state.cursor,
-              user: state.user,
-            };
-          }
+        provider.on('connection-error', (err) => {
+          console.error('WebSocket connection error:', err);
+          setError(`Connection error: ${err.message || 'Unknown error'}`);
         });
 
-        setCursors(newCursors);
-      };
+        provider.on('connection-close', (event) => {
+          console.log('WebSocket connection closed:', event);
+          setError('Connection closed');
+        });
 
-      awareness.on('change', awarenessChangeHandler);
+        const awareness = provider.awareness;
+        awareness.setLocalStateField('user', {
+          name: username,
+          color: `hsl(${Math.random() * 360}, 70%, 60%)`,
+        });
 
-      provider.awarenessChangeHandler = awarenessChangeHandler;
-    } catch (error) {
-      console.error('Failed to create WebsocketProvider:', error);
-      return;
-    }
+        const awarenessChangeHandler = () => {
+          const states = awareness.getStates();
+          const newCursors = {};
 
-    let isInitialized = false;
+          states.forEach((state, clientId) => {
+            if (clientId !== awareness.clientID && state.cursor) {
+              newCursors[clientId] = {
+                ...state.cursor,
+                user: state.user,
+              };
+            }
+          });
 
-    const handleStatus = ({ status }) => {
-      console.log('WebSocket status:', status);
-      setConnected(status === 'connected');
-      if (status === 'connected') {
-        setError(null);
-      }
-    };
+          setCursors(newCursors);
+        };
 
-    const handleSync = (isSynced) => {
-      console.log('Sync status:', isSynced);
-      setSynced(isSynced);
+        awareness.on('change', awarenessChangeHandler);
+        provider.awarenessChangeHandler = awarenessChangeHandler;
 
-      if (isSynced && !isInitialized) {
-        isInitialized = true;
-        if (yNodes.length === 0) {
-          console.log('Initializing nodes');
-          yNodes.insert(0, initialNodes);
+        let isInitialized = false;
+
+        const handleStatus = ({ status }) => {
+          console.log('WebSocket status:', status);
+          setConnected(status === 'connected');
+          if (status === 'connected') {
+            setError(null);
+          }
+        };
+
+        const handleSync = (isSynced) => {
+          console.log('Sync status:', isSynced);
+          setSynced(isSynced);
+
+          if (isSynced && !isInitialized) {
+            isInitialized = true;
+            console.log('Synced. Document state:', {
+              nodes: yNodes.length,
+              edges: yEdges.length
+            });
+          }
+        };
+
+        const nodesObserver = () => {
+          const newNodes = yNodes.toArray();
+          console.log('Nodes updated:', newNodes.length);
+          setNodes(newNodes);
+        };
+
+        const edgesObserver = () => {
+          const newEdges = yEdges.toArray();
+          console.log('Edges updated:', newEdges.length);
+          setEdges(newEdges);
+        };
+
+        yNodes.observe(nodesObserver);
+        yEdges.observe(edgesObserver);
+        provider.on('status', handleStatus);
+        provider.on('sync', handleSync);
+
+        if (yNodes.length > 0) {
+          setNodes(yNodes.toArray());
         }
-        if (yEdges.length === 0) {
-          console.log('Initializing edges');
-          yEdges.insert(0, initialEdges);
+        if (yEdges.length > 0) {
+          setEdges(yEdges.toArray());
         }
+
+        return () => {
+          console.log('Cleaning up listeners...');
+          yNodes.unobserve(nodesObserver);
+          yEdges.unobserve(edgesObserver);
+          provider.off('status', handleStatus);
+          provider.off('sync', handleSync);
+          if (provider.awarenessChangeHandler) {
+            provider.awareness.off('change', provider.awarenessChangeHandler);
+          }
+        };
+      } catch (error) {
+        console.error('Failed to create WebsocketProvider:', error);
+        return null;
       }
-    };
-
-    const nodesObserver = () => {
-      const newNodes = yNodes.toArray();
-      console.log('Nodes updated:', newNodes.length);
-      setNodes(newNodes);
-    };
-
-    const edgesObserver = () => {
-      const newEdges = yEdges.toArray();
-      console.log('Edges updated:', newEdges.length);
-      setEdges(newEdges);
-    };
-
-    yNodes.observe(nodesObserver);
-    yEdges.observe(edgesObserver);
-    provider.on('status', handleStatus);
-    provider.on('sync', handleSync);
-
-    if (yNodes.length > 0) {
-      setNodes(yNodes.toArray());
-    }
-    if (yEdges.length > 0) {
-      setEdges(yEdges.toArray());
     }
 
     return () => {
-      console.log('Cleaning up listeners...');
-      yNodes.unobserve(nodesObserver);
-      yEdges.unobserve(edgesObserver);
-      provider.off('status', handleStatus);
-      provider.off('sync', handleSync);
-      if (provider.awarenessChangeHandler) {
-        provider.awareness.off('change', provider.awarenessChangeHandler);
+      if (cleanup) {
+        cleanup();
       }
     };
   }, [username]);
@@ -178,21 +219,6 @@ export default function App() {
       const updatedNodes = applyNodeChanges(changes, nodes);
       yNodesRef.current.delete(0, yNodesRef.current.length);
       yNodesRef.current.insert(0, updatedNodes);
-
-      changes.forEach((change) => {
-        if (change.type === 'position' && change.dragging && reactFlowWrapper.current && providerRef.current) {
-          const rect = reactFlowWrapper.current.getBoundingClientRect();
-          if (window.lastMouseEvent) {
-            const x = window.lastMouseEvent.clientX - rect.left;
-            const y = window.lastMouseEvent.clientY - rect.top;
-            providerRef.current.awareness.setLocalStateField('cursor', {
-              x,
-              y,
-              timestamp: Date.now(),
-            });
-          }
-        }
-      });
     },
     [nodes]
   );
@@ -224,15 +250,23 @@ export default function App() {
     if (!providerRef.current || !reactFlowWrapper.current) return;
 
     const rect = reactFlowWrapper.current.getBoundingClientRect();
-    const x = event.clientX - rect.left;
-    const y = event.clientY - rect.top;
+    const screenX = event.clientX - rect.left;
+    const screenY = event.clientY - rect.top;
 
-    providerRef.current.awareness.setLocalStateField('cursor', {
-      x,
-      y,
-      timestamp: Date.now(),
-    });
-  }, []);
+    // Convert screen coordinates to flow coordinates
+    const flowPosition = screenToFlowPosition({ x: screenX, y: screenY });
+
+    // Throttle awareness updates to avoid flooding the server
+    const now = Date.now();
+    if (!window.lastAwarenessUpdate || now - window.lastAwarenessUpdate > 50) {
+      window.lastAwarenessUpdate = now;
+      providerRef.current.awareness.setLocalStateField('cursor', {
+        x: flowPosition.x,
+        y: flowPosition.y,
+        timestamp: now,
+      });
+    }
+  }, [screenToFlowPosition]);
 
   const handleMouseLeave = useCallback(() => {
     if (!providerRef.current) return;
@@ -243,17 +277,54 @@ export default function App() {
     if (!providerRef.current || !reactFlowWrapper.current) return;
 
     const rect = reactFlowWrapper.current.getBoundingClientRect();
-    const x = event.clientX - rect.left;
-    const y = event.clientY - rect.top;
+    const screenX = event.clientX - rect.left;
+    const screenY = event.clientY - rect.top;
 
-    providerRef.current.awareness.setLocalStateField('cursor', {
-      x,
-      y,
-      timestamp: Date.now(),
-      dragging: true,
-      nodeId: node.id,
-    });
+    // Convert screen coordinates to flow coordinates
+    const flowPosition = screenToFlowPosition({ x: screenX, y: screenY });
+
+    // Throttle drag awareness updates
+    const now = Date.now();
+    if (!window.lastDragAwarenessUpdate || now - window.lastDragAwarenessUpdate > 50) {
+      window.lastDragAwarenessUpdate = now;
+      providerRef.current.awareness.setLocalStateField('cursor', {
+        x: flowPosition.x,
+        y: flowPosition.y,
+        timestamp: now,
+        dragging: true,
+        nodeId: node.id,
+      });
+    }
+  }, [screenToFlowPosition]);
+
+  const addNode = useCallback((position) => {
+    if (!yNodesRef.current) return;
+
+    // Generate unique node ID
+    const nodeId = `node-${Date.now()}-${Math.random().toString(36).substring(2, 11)}`;
+    const newNode = {
+      id: nodeId,
+      position: position || { x: Math.random() * 400, y: Math.random() * 400 },
+      data: { label: `Node ${nodeId.split('-')[1]}` },
+    };
+
+    // Add to Yjs array
+    const currentNodes = yNodesRef.current.toArray();
+    yNodesRef.current.delete(0, yNodesRef.current.length);
+    yNodesRef.current.insert(0, [...currentNodes, newNode]);
   }, []);
+
+  const handlePaneDoubleClick = useCallback((event) => {
+    if (!reactFlowWrapper.current) return;
+
+    const rect = reactFlowWrapper.current.getBoundingClientRect();
+    const screenX = event.clientX - rect.left;
+    const screenY = event.clientY - rect.top;
+
+    // Convert screen coordinates to flow coordinates
+    const flowPosition = screenToFlowPosition({ x: screenX, y: screenY });
+    addNode(flowPosition);
+  }, [screenToFlowPosition, addNode]);
 
   return (
     <div
@@ -293,8 +364,30 @@ export default function App() {
         }}>
           <span>{connected ? 'Connected' : 'Disconnected'}</span>
         </div>
-        <div style={{ fontSize: '12px', color: '#666' }}>
+        <div style={{ fontSize: '12px', color: '#666', marginBottom: '8px' }}>
           {synced ? 'Synced' : 'Syncing...'}
+        </div>
+        <button
+          onClick={() => addNode()}
+          style={{
+            width: '100%',
+            padding: '8px 12px',
+            background: '#007bff',
+            color: 'white',
+            border: 'none',
+            borderRadius: '4px',
+            cursor: 'pointer',
+            fontSize: '13px',
+            fontWeight: '500',
+            transition: 'background 0.2s',
+          }}
+          onMouseOver={(e) => e.target.style.background = '#0056b3'}
+          onMouseOut={(e) => e.target.style.background = '#007bff'}
+        >
+          Add Node
+        </button>
+        <div style={{ fontSize: '11px', color: '#999', marginTop: '8px', textAlign: 'center' }}>
+          Double-click canvas to add node
         </div>
         {error && (
           <div
@@ -314,18 +407,25 @@ export default function App() {
       </div>
 
       {
-        Object.entries(cursors).map(([clientId, cursor]) => (
-          <div
-            key={clientId}
-            style={{
-              position: 'absolute',
-              left: cursor.x,
-              top: cursor.y,
-              pointerEvents: 'none',
-              zIndex: 1000,
-              transition: 'left 0.1s ease-out, top 0.1s ease-out',
-            }}
-          >
+        Object.entries(cursors).map(([clientId, cursor]) => {
+          // Skip if cursor doesn't have coordinates
+          if (!cursor || cursor.x === undefined || cursor.y === undefined) return null;
+          
+          // Convert flow coordinates back to screen coordinates for rendering
+          const screenPosition = flowToScreenPosition({ x: cursor.x, y: cursor.y });
+          
+          return (
+            <div
+              key={clientId}
+              style={{
+                position: 'absolute',
+                left: screenPosition.x,
+                top: screenPosition.y,
+                pointerEvents: 'none',
+                zIndex: 1000,
+                transition: 'left 0.1s ease-out, top 0.1s ease-out',
+              }}
+            >
             {/* Cursor pointer */}
             {/* <svg
               width="24"
@@ -371,7 +471,8 @@ export default function App() {
               {cursor.user?.name || 'Anonymous'}
             </div>
           </div>
-        ))
+          );
+        })
       }
 
       <ReactFlow
@@ -381,8 +482,17 @@ export default function App() {
         onEdgesChange={onEdgesChange}
         onConnect={onConnect}
         onNodeDrag={onNodeDrag}
+        onPaneDoubleClick={handlePaneDoubleClick}
         fitView
       />
     </div >
+  );
+}
+
+export default function App() {
+  return (
+    <ReactFlowProvider>
+      <FlowCanvas />
+    </ReactFlowProvider>
   );
 }
