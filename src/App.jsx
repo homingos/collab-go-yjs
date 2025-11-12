@@ -1,4 +1,4 @@
-import { ReactFlow, addEdge, applyEdgeChanges, applyNodeChanges, useReactFlow, ReactFlowProvider } from '@xyflow/react';
+import { ReactFlow, ReactFlowProvider, addEdge, applyEdgeChanges, applyNodeChanges, useReactFlow } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { WebsocketProvider } from 'y-websocket';
@@ -38,6 +38,9 @@ function FlowCanvas() {
   const [error, setError] = useState(null);
   const [username] = useState(() => generateUsername());
   const [cursors, setCursors] = useState({});
+  const [roomName, setRoomName] = useState("");
+  const [showRoomModal, setShowRoomModal] = useState(true);
+  const [joinOrCreate, setJoinOrCreate] = useState(null); // 'join' or 'create'
 
   // Use refs to store Yjs objects
   const ydocRef = useRef(null);
@@ -47,6 +50,7 @@ function FlowCanvas() {
   const reactFlowWrapper = useRef(null);
 
   useEffect(() => {
+    if (!roomName || !joinOrCreate) return;
     if (ydocRef.current) {
       console.log('Yjs already initialized, skipping...');
       return;
@@ -62,14 +66,25 @@ function FlowCanvas() {
     yEdgesRef.current = yEdges;
 
     // Fetch initial document state from HTTP endpoint before connecting WebSocket
-    const roomName = 'flow-document';
     const docStateUrl = `http://localhost:8080/doc/${roomName}`;
-    
+
     let cleanup = null;
-    
-    fetch(docStateUrl)
+
+    // If creating, POST to create room, then GET document state
+    const fetchDocState = async () => {
+      if (joinOrCreate === 'create') {
+        const createRes = await fetch(docStateUrl, { method: 'POST' });
+        if (!createRes.ok && createRes.status !== 201) {
+          throw new Error(`Room creation failed: ${createRes.status}`);
+        }
+      }
+      // Always fetch document state after create or join
+      return fetch(docStateUrl);
+    };
+
+    Promise.resolve(fetchDocState())
       .then(response => {
-        if (response.status === 204 || response.status === 404) {
+        if (!response || response.status === 204 || response.status === 404) {
           console.log('No existing document state, starting fresh');
           return null;
         }
@@ -84,8 +99,12 @@ function FlowCanvas() {
           const update = new Uint8Array(buffer);
           Y.applyUpdate(ydoc, update);
           console.log('Document state loaded successfully');
+        } else {
+          // If new room, initialize with default nodes/edges
+          yNodes.insert(0, initialNodes);
+          yEdges.insert(0, initialEdges);
+          console.log('Initialized new room with default nodes/edges');
         }
-        
         // Now connect WebSocket after loading initial state
         return setupWebSocketProvider(roomName, ydoc, yNodes, yEdges);
       })
@@ -211,7 +230,7 @@ function FlowCanvas() {
         cleanup();
       }
     };
-  }, [username]);
+  }, [username, roomName, joinOrCreate]);
 
   const onNodesChange = useCallback(
     (changes) => {
@@ -333,6 +352,89 @@ function FlowCanvas() {
       onMouseMove={handleMouseMove}
       onMouseLeave={handleMouseLeave}
     >
+      {/* Room Modal */}
+      {showRoomModal && (
+        <div style={{
+          position: 'fixed',
+          top: 0,
+          left: 0,
+          width: '100vw',
+          height: '100vh',
+          background: 'rgba(0,0,0,0.25)',
+          zIndex: 9999,
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+        }}>
+          <div style={{
+            background: 'white',
+            padding: '32px 40px',
+            borderRadius: '12px',
+            boxShadow: '0 4px 24px rgba(0,0,0,0.18)',
+            minWidth: '320px',
+            textAlign: 'center',
+          }}>
+            <h2 style={{ marginBottom: '18px', fontWeight: 700 }}>Enter Room Name</h2>
+            <input
+              type="text"
+              value={roomName}
+              onChange={e => setRoomName(e.target.value.replace(/\s+/g, '-'))}
+              placeholder="Room name"
+              style={{
+                width: '80%',
+                padding: '10px',
+                fontSize: '16px',
+                borderRadius: '6px',
+                border: '1px solid #ccc',
+                marginBottom: '18px',
+              }}
+              autoFocus
+            />
+            <div style={{ display: 'flex', gap: '16px', justifyContent: 'center', marginBottom: '8px' }}>
+              <button
+                style={{
+                  padding: '10px 18px',
+                  background: '#007bff',
+                  color: 'white',
+                  border: 'none',
+                  borderRadius: '6px',
+                  fontWeight: 600,
+                  fontSize: '15px',
+                  cursor: roomName ? 'pointer' : 'not-allowed',
+                  opacity: roomName ? 1 : 0.6,
+                }}
+                disabled={!roomName}
+                onClick={() => {
+                  setJoinOrCreate('create');
+                  setShowRoomModal(false);
+                }}
+              >Create Room</button>
+              <button
+                style={{
+                  padding: '10px 18px',
+                  background: '#28a745',
+                  color: 'white',
+                  border: 'none',
+                  borderRadius: '6px',
+                  fontWeight: 600,
+                  fontSize: '15px',
+                  cursor: roomName ? 'pointer' : 'not-allowed',
+                  opacity: roomName ? 1 : 0.6,
+                }}
+                disabled={!roomName}
+                onClick={() => {
+                  setJoinOrCreate('join');
+                  setShowRoomModal(false);
+                }}
+              >Join Room</button>
+            </div>
+            <div style={{ fontSize: '13px', color: '#888', marginTop: '8px' }}>
+              Room name must not be empty
+            </div>
+          </div>
+        </div>
+      )}
+      {/* ...existing code... */}
       <div
         style={{
           position: 'absolute',
@@ -347,134 +449,9 @@ function FlowCanvas() {
           minWidth: '180px',
         }}
       >
-        <div style={{
-          fontWeight: '600',
-          marginBottom: '8px',
-          color: '#333',
-          fontStyle: 'strong',
-        }}>
-          {username}
-        </div>
-        <div style={{
-          display: 'flex',
-          alignItems: 'center',
-          gap: '6px',
-          marginBottom: '4px',
-          color: connected ? 'green' : 'red',
-        }}>
-          <span>{connected ? 'Connected' : 'Disconnected'}</span>
-        </div>
-        <div style={{ fontSize: '12px', color: '#666', marginBottom: '8px' }}>
-          {synced ? 'Synced' : 'Syncing...'}
-        </div>
-        <button
-          onClick={() => addNode()}
-          style={{
-            width: '100%',
-            padding: '8px 12px',
-            background: '#007bff',
-            color: 'white',
-            border: 'none',
-            borderRadius: '4px',
-            cursor: 'pointer',
-            fontSize: '13px',
-            fontWeight: '500',
-            transition: 'background 0.2s',
-          }}
-          onMouseOver={(e) => e.target.style.background = '#0056b3'}
-          onMouseOut={(e) => e.target.style.background = '#007bff'}
-        >
-          Add Node
-        </button>
-        <div style={{ fontSize: '11px', color: '#999', marginTop: '8px', textAlign: 'center' }}>
-          Double-click canvas to add node
-        </div>
-        {error && (
-          <div
-            style={{
-              marginTop: '8px',
-              padding: '6px 8px',
-              background: '#fee',
-              border: '1px solid #fcc',
-              borderRadius: '4px',
-              fontSize: '11px',
-              color: '#c33',
-            }}
-          >
-            {error}
-          </div>
-        )}
+        {/* ...existing code... */}
       </div>
-
-      {
-        Object.entries(cursors).map(([clientId, cursor]) => {
-          // Skip if cursor doesn't have coordinates
-          if (!cursor || cursor.x === undefined || cursor.y === undefined) return null;
-          
-          // Convert flow coordinates back to screen coordinates for rendering
-          const screenPosition = flowToScreenPosition({ x: cursor.x, y: cursor.y });
-          
-          return (
-            <div
-              key={clientId}
-              style={{
-                position: 'absolute',
-                left: screenPosition.x,
-                top: screenPosition.y,
-                pointerEvents: 'none',
-                zIndex: 1000,
-                transition: 'left 0.1s ease-out, top 0.1s ease-out',
-              }}
-            >
-            {/* Cursor pointer */}
-            {/* <svg
-              width="24"
-              height="24"
-              viewBox="0 0 24 24"
-              fill="none"
-              style={{ transform: 'translate(-2px, -2px)' }}
-            >
-              <path
-                d="M5.65376 12.3673L8.96375 15.6773L11.6297 19.3423C11.8617 19.6863 12.3577 19.6863 12.5897 19.3423L19.3457 9.3833C19.5777 9.0393 19.3307 8.5623 18.9167 8.5623H8.49375C8.19975 8.5623 7.90575 8.6763 7.69375 8.8883L5.65376 10.9283C5.22776 11.3543 5.22776 12.0553 5.65376 12.3673Z"
-                fill={cursor.user?.color || '#000'}
-                stroke="white"
-                strokeWidth="1.5"
-              />
-            </svg> */}
-            <svg
-              xmlns="http://www.w3.org/2000/svg"
-              width="48"
-              height="48"
-              viewBox="0 0 24 24"
-            >
-              <path
-                fill={cursor.user?.color || '#000'}
-                stroke="#000"
-                strokeWidth="2" d="M5.5 3.21V20.8c0 .45.54.67.85.35l4.86-4.86a.5.5 0 0 1 .35-.15h6.87a.5.5 0 0 0 .35-.85L6.35 2.85a.5.5 0 0 0-.85.35Z">
-              </path>
-            </svg>
-            {/* Username label */}
-            <div
-              style={{
-                marginLeft: '20px',
-                marginTop: '-20px',
-                padding: '4px 8px',
-                background: cursor.user?.color || '#000',
-                color: 'white',
-                borderRadius: '4px',
-                fontSize: '12px',
-                fontWeight: '500',
-                whiteSpace: 'nowrap',
-                boxShadow: '0 2px 4px rgba(0,0,0,0.2)',
-              }}
-            >
-              {cursor.user?.name || 'Anonymous'}
-            </div>
-          </div>
-          );
-        })
-      }
-
+      {/* ...existing code... */}
       <ReactFlow
         nodes={nodes}
         edges={edges}
@@ -485,7 +462,7 @@ function FlowCanvas() {
         onPaneDoubleClick={handlePaneDoubleClick}
         fitView
       />
-    </div >
+    </div>
   );
 }
 
