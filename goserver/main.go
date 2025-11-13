@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
@@ -11,6 +12,7 @@ import (
 
 	"go-yjs-server/server"
 	natsync "go-yjs-server/sync"
+	"go-yjs-server/yrs"
 
 	"github.com/gorilla/websocket"
 )
@@ -120,19 +122,14 @@ func main() {
 		os.Exit(0)
 	}()
 
-	// HTTP endpoint to fetch document state
+	// HTTP endpoint to fetch or update document state
 	http.HandleFunc("/doc/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 
 		if r.Method == "OPTIONS" {
 			w.WriteHeader(http.StatusOK)
-			return
-		}
-
-		if r.Method != "GET" {
-			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
 
@@ -147,20 +144,73 @@ func main() {
 		// Get or create room to ensure it's loaded
 		room := getOrCreateRoom(roomName)
 
-		// Get document state
-		docState := room.GetDocumentState()
+		if r.Method == "GET" {
+			// Get document state
+			docState := room.GetDocumentState()
 
-		if len(docState) == 0 {
-			// No document state, return 204 No Content
-			w.WriteHeader(http.StatusNoContent)
+			if len(docState) == 0 {
+				// No document state, return 204 No Content
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
+
+			// Return document state as binary
+			w.Header().Set("Content-Type", "application/octet-stream")
+			w.Header().Set("Content-Length", fmt.Sprintf("%d", len(docState)))
+			w.WriteHeader(http.StatusOK)
+			w.Write(docState)
 			return
 		}
 
-		// Return document state as binary
-		w.Header().Set("Content-Type", "application/octet-stream")
-		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(docState)))
-		w.WriteHeader(http.StatusOK)
-		w.Write(docState)
+		if r.Method == "POST" {
+			// Accept JSON payload: { "nodes": [...] }
+			type Node struct {
+				ID       string                 `json:"id"`
+				Position map[string]float64     `json:"position"`
+				Data     map[string]interface{} `json:"data"`
+			}
+			var payload struct {
+				Nodes []Node `json:"nodes"`
+			}
+			err := json.NewDecoder(r.Body).Decode(&payload)
+			if err != nil {
+				http.Error(w, "Invalid JSON payload", http.StatusBadRequest)
+				return
+			}
+
+			log.Printf("Received external node update for room %s: %d nodes", roomName, len(payload.Nodes))
+			nodesJSON, err := json.Marshal(payload.Nodes)
+			if err != nil {
+				http.Error(w, "Failed to encode nodes", http.StatusInternalServerError)
+				return
+			}
+			log.Println("Nodes JSON:", string(nodesJSON))
+
+			// Encode a Yjs update to set the "nodes" array
+			// TODO: Implement EncodeNodesArrayUpdate in your FFI (Rust + Go binding)
+			update, err := yrs.EncodeNodesArrayUpdate(nodesJSON)
+			if err != nil {
+				http.Error(w, "Failed to encode Yjs update", http.StatusInternalServerError)
+				return
+			}
+
+			doc := room.GetDoc()
+			txn := doc.WriteTransaction(nil)
+			applyErr := txn.Apply(update)
+			if applyErr != nil {
+				http.Error(w, "Failed to apply Yjs update", http.StatusInternalServerError)
+				return
+			}
+			txn.Commit()
+
+			// Save the current document state to KV store
+			room.SaveDocumentState()
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte("{\"status\":\"updated\"}"))
+			return
+		}
+
+		w.WriteHeader(http.StatusMethodNotAllowed)
 	})
 
 	// WebSocket endpoint
@@ -175,6 +225,46 @@ func main() {
 		}
 
 		handleWebSocket(w, r)
+	})
+
+	// Simple GET API to retrieve KV store data for a room
+	http.HandleFunc("/api/kv/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Content-Type", "application/octet-stream")
+
+		roomName := r.URL.Path[len("/api/kv/"):]
+		if roomName == "" {
+			roomName = "/default"
+		} else {
+			roomName = "/" + roomName
+		}
+
+		room := getOrCreateRoom(roomName)
+		docState := room.GetDocumentState()
+		if len(docState) == 0 {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		w.Write(docState)
+	})
+
+	// GET API to return nodes array as JSON (requires Room.GetNodesAsJSON implementation)
+	http.HandleFunc("/api/nodes/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Content-Type", "application/json")
+
+		roomName := r.URL.Path[len("/api/nodes/"):]
+		if roomName == "" {
+			roomName = "/default"
+		} else {
+			roomName = "/" + roomName
+		}
+
+		room := getOrCreateRoom(roomName)
+		// This method must be implemented in your Room struct
+		nodes := room.GetNodesAsJSON() // <-- You must implement this!
+		json.NewEncoder(w).Encode(nodes)
 	})
 
 	port := "0.0.0.0:8080"

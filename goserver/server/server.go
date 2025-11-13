@@ -185,6 +185,7 @@ func (r *Room) broadcastAwarenessUpdate() {
 }
 
 // GetDoc returns the document for this room
+
 func (r *Room) GetDoc() *yrs.Doc {
 	return r.doc
 }

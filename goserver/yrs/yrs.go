@@ -27,6 +27,9 @@ uint8_t ytransaction_apply(void* txn, const uint8_t* diff, uint32_t diff_len);
 
 void ybinary_destroy(uint8_t* ptr, uint32_t len);
 void ystring_destroy(char* str);
+
+// Encode nodes update function
+int ydoc_encode_nodes_update(const uint8_t* nodes_json_ptr, size_t nodes_json_len, const uint8_t** out_ptr, size_t* out_len);
 */
 import "C"
 import (
@@ -187,6 +190,39 @@ func (t *Transaction) Apply(update []byte) error {
 	}
 
 	return nil
+}
+
+// EncodeNodesArrayUpdate creates a Y.Array update from a JSON array
+func EncodeNodesArrayUpdate(nodesJSON []byte) ([]byte, error) {
+	if len(nodesJSON) == 0 {
+		return nil, errors.New("empty JSON input")
+	}
+
+	var outPtr *C.uint8_t
+	var outLen C.size_t
+
+	result := C.ydoc_encode_nodes_update(
+		(*C.uint8_t)(unsafe.Pointer(&nodesJSON[0])),
+		C.size_t(len(nodesJSON)),
+		(**C.uint8_t)(unsafe.Pointer(&outPtr)),
+		&outLen,
+	)
+
+	if result != 0 {
+		switch result {
+		case 1:
+			return nil, errors.New("invalid UTF-8 in JSON input")
+		case 2:
+			return nil, errors.New("invalid JSON format")
+		default:
+			return nil, errors.New("FFI error encoding nodes update")
+		}
+	}
+
+	// Copy the update bytes from C memory
+	update := C.GoBytes(unsafe.Pointer(outPtr), C.int(outLen))
+
+	return update, nil
 }
 
 // YrsError represents a Yrs error
